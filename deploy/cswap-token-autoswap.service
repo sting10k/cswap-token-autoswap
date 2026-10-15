@@ -1,0 +1,16 @@
+# systemd user unit. Installed by deploy/install-linux-systemd.sh (paths are filled in there).
+[Unit]
+Description=cswap token autoswap watcher (rotates Claude Code setup-tokens via claude-swap)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@APP_DIR@
+ExecStart=@NODE_BIN@ @APP_DIR@/token-autoswap-watcher.js
+# claude + cswap live in ~/.local/bin, which isn't on systemd's default PATH
+Environment=PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,7 @@
+# Runtime state written by the watcher
+status.json
+autoswap.log
+watcher.pid
+*.bak
+node_modules/
+launchd.*.log
