@@ -87,23 +87,38 @@ async function tick() {
   }
 
   // Re-probe candidates right before choosing so the decision uses fresh numbers
-  const candidates = [];
+  const byRoom = (a, b) => peakUtil(a.r) - peakUtil(b.r);
+  const probed = [];
   for (const s of slots) {
     if (s.num === active) continue;
-    const r = await probe(s);
-    if (!r.transient && !isSpent(r)) candidates.push({ s, r });
+    probed.push({ s, r: await probe(s) });
   }
-  candidates.sort((a, b) => peakUtil(a.r) - peakUtil(b.r));
-  if (!candidates.length) {
-    return writeStatus(active, slots, current ? 'blocked: all tokens spent' : 'blocked: no healthy token to move onto', BLOCKED_MS);
-  }
+  const candidates = probed.filter(({ r }) => !r.transient && !isSpent(r)).sort(byRoom);
+  if (candidates.length) return switchAndReport(active, currentReading, candidates[0], slots, 'switched');
 
-  const target = candidates[0];
+  // Every other slot is at/over the threshold too. While the active token still serves, stay on it
+  // (moving between near-full tokens only burns probes). Once it stops serving (rejected/429/invalid),
+  // escape to the slot with the most room left that still answers, even if it is over the threshold.
+  if (current && hardFail) {
+    const escape = probed.filter(({ r }) => !r.transient && !r.exhausted && !r.invalid).sort(byRoom)[0];
+    if (escape) return switchAndReport(active, currentReading, escape, slots, 'escaped: all tokens over threshold');
+  }
+  return writeStatus(active, slots, current ? 'blocked: all tokens spent' : 'blocked: no healthy token to move onto', BLOCKED_MS);
+}
+
+async function switchAndReport(active, currentReading, target, slots, state) {
   log(`switch ${active} [${describe(currentReading)}] -> ${target.s.num} [${describe(target.r)}]`);
   await switchTo(target.s.num);
   lastSwitchAt = Date.now();
   // The target was just probed, so its reading drives the next cadence
-  return writeStatus(target.s.num, slots, 'switched', cadenceFor(target.r));
+  return writeStatus(target.s.num, slots, state, cadenceFor(target.r));
+}
+
+// Machine-readable copy of a reading for status.json (used by `--quota`)
+function readingDetail(r) {
+  if (!r) return null;
+  const { at, quotaStatus, httpStatus, util5h, util7d, utilPeak, reset5h, reset7d, invalid, exhausted, transient, error } = r;
+  return { at: new Date(at).toISOString(), quotaStatus, httpStatus, util5h, util7d, utilPeak, reset5h, reset7d, invalid, exhausted, transient, error };
 }
 
 function writeStatus(active, slots, state, nextMs) {
@@ -113,7 +128,9 @@ function writeStatus(active, slots, state, nextMs) {
     active,
     threshold: THRESHOLD,
     nextProbeAt: new Date(Date.now() + nextMs).toISOString(),
-    slots: slots.map((s) => ({ num: s.num, email: s.email, reading: describe(readings.get(s.num)) })),
+    slots: slots.map((s) => ({
+      num: s.num, email: s.email, reading: describe(readings.get(s.num)), detail: readingDetail(readings.get(s.num)),
+    })),
   };
   fs.writeFileSync(STATUS_FILE, JSON.stringify(status, null, 2));
   // Log only state transitions so an idle/blocked watcher doesn't flood the log every tick
@@ -133,6 +150,9 @@ function acquireSingleInstance() {
 }
 
 async function main() {
+  if (process.argv.includes('--quota')) {
+    return require('./quota-report').quotaReport({ fresh: process.argv.includes('--fresh'), statusFile: STATUS_FILE, threshold: THRESHOLD });
+  }
   if (process.argv.includes('--once')) return tick();
   if (!acquireSingleInstance()) return;
   log(`watcher started (cadence ${SLOW_MS / 1000}/${MID_MS / 1000}/${FAST_MS / 1000}s, threshold ${THRESHOLD * 100}%)`);
@@ -142,5 +162,5 @@ async function main() {
   }
 }
 
-module.exports = { cadenceFor };
+module.exports = { cadenceFor, tick };
 if (require.main === module) main();

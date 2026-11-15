@@ -24,7 +24,7 @@ The script never calls the API directly. Tokens are only ever used by Claude Cod
 
 - Node.js >= 18
 - Claude Code CLI (`claude`) on `PATH`
-- claude-swap (`cswap`) >= 0.27, Python >= 3.12. Install it via uv as shown below.
+- claude-swap (`cswap`) >= 0.27 (tested up to 1.1.0; keep `usage.headerProbe` off), Python >= 3.12. Install it via uv as shown below.
 
 ## Install
 
@@ -103,7 +103,13 @@ powershell -ExecutionPolicy ByPass -File deploy\install-windows-task.ps1
   or an invalid token (401/403).
 - **Which token it picks:** the healthy token with the lowest utilization. There is a 2-minute cooldown between
   threshold-based switches.
-- **When every token is spent:** it stays on the current token and `status.json` shows `blocked`.
+- **When every other token is also over the threshold:**
+  - While the active token still serves, the watcher stays on it and `status.json` shows `blocked`. Moving
+    between near-full tokens would only burn probes.
+  - Once the active token stops serving (`rejected`/429, or invalid), it escapes to the slot with the most room
+    left that still answers, even if that slot is over the threshold (state `escaped: all tokens over threshold`).
+  - While blocked, every slot is re-checked about every 10 minutes, and the watcher switches as soon as one drops
+    back under the threshold after its window resets.
 - **Manual switches are respected.** Each tick reads the active slot from cswap, so `cswap switch` by hand is fine.
 - **Limitation:** a token can still hit a 429 between two probes. That one agent turn fails; the next probe
   switches, and you re-send the prompt. Paseo marks such a turn as `completed`, not `error`.
@@ -140,6 +146,26 @@ before relying on it.
 
 ## Operations
 
+### Check quota
+
+```bash
+node token-autoswap-watcher.js --quota          # from the running watcher's status.json: free, no request
+node token-autoswap-watcher.js --quota --fresh  # probe every slot now (~$0.0007 each); never switches
+```
+
+```
+Fresh probe of 2 slot(s) · switch threshold 90% · * = active
+SLOT     STATUS    5H   RESETS     7D   RESETS      AS OF
+2     *  allowed   16%  in 4h 42m  2%   in 12h 32m  0m ago
+3        OVER 90%  29%  in 42m     90%  in 1d 9h    0m ago
+```
+
+Without `--fresh`, idle slots only have the reading from the last switch (or `unprobed` after a restart).
+Don't use `cswap list` for this: setup-token slots show `usage unavailable` there unless `usage.headerProbe` is
+on, and that probe would run alongside this watcher's.
+
+### Other
+
 - Status: `status.json` (active slot, last reading per slot, `nextProbeAt`)
 - Log: `autoswap.log` (switches and state changes only)
 - One-shot tick: `node token-autoswap-watcher.js --once`
@@ -151,6 +177,7 @@ before relying on it.
 |---|---|
 | `token-autoswap-watcher.js` | Main loop: probe, decide, switch, adaptive cadence |
 | `setup-token-quota-probe.js` | Runs `claude -p` and parses `rate_limit_event` |
+| `quota-report.js` | `--quota` table (from `status.json`, or `--fresh` probes of every slot) |
 | `cswap-account-store.js` | Reads cswap's roster and stored tokens; switches via the `cswap` CLI |
 | `deploy/` | Installers: systemd (Linux), launchd (macOS), Scheduled Task (Windows) |
 
