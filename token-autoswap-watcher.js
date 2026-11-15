@@ -7,20 +7,21 @@ const fs = require('fs');
 const path = require('path');
 const { probeToken } = require('./setup-token-quota-probe');
 const { listSetupTokenSlots, switchTo } = require('./cswap-account-store');
+const { THRESHOLD_5H, THRESHOLD_WEEKLY, load, isSpent, binding, shortName } = require('./quota-policy');
 
 // Adaptive cadence (mirrors claude-swap's poll_policy, but sparser since each probe is a real
-// Claude Code turn): slow while the active token has headroom, faster as it nears the threshold
-// or burns quickly. Only the active slot is probed on a schedule.
-const SLOW_MS = Number(process.env.AUTOSWAP_SLOW_S || 900) * 1000; // peak < MID_AT
-const MID_MS = Number(process.env.AUTOSWAP_MID_S || 300) * 1000; // MID_AT <= peak < FAST_AT
-const FAST_MS = Number(process.env.AUTOSWAP_FAST_S || 120) * 1000; // peak >= FAST_AT, or rising fast
-const BLOCKED_MS = 600 * 1000; // all tokens spent: wait for a reset
+// Claude Code turn): slow while the active token has headroom, faster as it nears its switch line
+// or burns quickly. Only the active slot is probed on a schedule. "Load" is the binding window's
+// utilization relative to its own line (see quota-policy.js): 1.0 = at the line.
+const SLOW_MS = Number(process.env.AUTOSWAP_SLOW_S || 900) * 1000; // load < MID_AT
+const MID_MS = Number(process.env.AUTOSWAP_MID_S || 300) * 1000; // MID_AT <= load < FAST_AT
+const FAST_MS = Number(process.env.AUTOSWAP_FAST_S || 120) * 1000; // load >= FAST_AT, rising fast, or blocked
+const BLOCKED_MS = 600 * 1000; // every token dead: wait for a reset
 const ERROR_MS = 300 * 1000; // probe failed (network, CLI): retry sooner than SLOW
-const MID_AT = 0.7;
-const FAST_AT = 0.85;
-const FAST_RISE = 0.05; // peak grew >= 5 points since the previous probe -> heavy use
+const MID_AT = 0.78; // ~70% of a 90% line
+const FAST_AT = 0.94; // ~85% of a 90% line
+const FAST_RISE = 0.05; // load grew >= 5 points since the previous probe -> heavy use
 const JITTER = 0.1; // +-10% so probes don't land on a fixed grid
-const THRESHOLD = Number(process.env.AUTOSWAP_THRESHOLD || 0.9);
 const COOLDOWN_MS = Number(process.env.AUTOSWAP_COOLDOWN_S || 120) * 1000;
 const STATUS_FILE = path.join(__dirname, 'status.json');
 const LOG_FILE = path.join(__dirname, 'autoswap.log');
@@ -36,14 +37,12 @@ function log(msg) {
   fs.appendFile(LOG_FILE, line + '\n', () => {});
 }
 
-const peakUtil = (r) => r.utilPeak ?? Math.max(r.util5h ?? 0, r.util7d ?? 0);
-const isSpent = (r) => r.exhausted || r.invalid || peakUtil(r) >= THRESHOLD;
 
 async function probe(slot) {
   const prev = readings.get(slot.num);
   try {
     const r = await probeToken(slot.token);
-    const rise = prev && !prev.transient && r.utilPeak != null ? r.utilPeak - peakUtil(prev) : 0;
+    const rise = prev && !prev.transient ? load(r) - load(prev) : 0;
     readings.set(slot.num, { at: Date.now(), ...r, rise });
   } catch (e) {
     readings.set(slot.num, { at: Date.now(), error: e.message, transient: true });
@@ -55,15 +54,17 @@ function describe(r) {
   if (!r) return 'unprobed';
   if (r.transient) return `error(${r.error})`;
   const pct = (v) => (v == null ? '-' : `${Math.round(v * 100)}%`);
-  return `${r.quotaStatus || r.httpStatus} 5h=${pct(r.util5h)} 7d=${pct(r.util7d)} peak=${pct(r.utilPeak)}${r.invalid ? ' INVALID' : ''}`;
+  const b = binding(r);
+  const lineInfo = b.name ? ` load=${pct(b.load)}(${shortName(b.name)})` : '';
+  return `${r.quotaStatus || r.httpStatus} 5h=${pct(r.util5h)} 7d=${pct(r.util7d)}${lineInfo}${r.invalid ? ' INVALID' : ''}`;
 }
 
 // Delay until the next probe of the active slot, from its latest reading
 function cadenceFor(r) {
   let ms;
   if (!r || r.transient) ms = ERROR_MS;
-  else if (peakUtil(r) >= FAST_AT || r.rise >= FAST_RISE) ms = FAST_MS;
-  else if (peakUtil(r) >= MID_AT) ms = MID_MS;
+  else if (load(r) >= FAST_AT || r.rise >= FAST_RISE) ms = FAST_MS;
+  else if (load(r) >= MID_AT) ms = MID_MS;
   else ms = SLOW_MS;
   return Math.round(ms * (1 + (Math.random() * 2 - 1) * JITTER));
 }
@@ -87,7 +88,7 @@ async function tick() {
   }
 
   // Re-probe candidates right before choosing so the decision uses fresh numbers
-  const byRoom = (a, b) => peakUtil(a.r) - peakUtil(b.r);
+  const byRoom = (a, b) => load(a.r) - load(b.r);
   const probed = [];
   for (const s of slots) {
     if (s.num === active) continue;
@@ -103,7 +104,9 @@ async function tick() {
     const escape = probed.filter(({ r }) => !r.transient && !r.exhausted && !r.invalid).sort(byRoom)[0];
     if (escape) return switchAndReport(active, currentReading, escape, slots, 'escaped: all tokens over threshold');
   }
-  return writeStatus(active, slots, current ? 'blocked: all tokens spent' : 'blocked: no healthy token to move onto', BLOCKED_MS);
+  // Blocked but the active token still serves: it is close to dying, so check again soon to escape quickly
+  const blockedMs = current && !hardFail ? FAST_MS : BLOCKED_MS;
+  return writeStatus(active, slots, current ? 'blocked: all tokens spent' : 'blocked: no healthy token to move onto', blockedMs);
 }
 
 async function switchAndReport(active, currentReading, target, slots, state) {
@@ -118,7 +121,7 @@ async function switchAndReport(active, currentReading, target, slots, state) {
 function readingDetail(r) {
   if (!r) return null;
   const { at, quotaStatus, httpStatus, util5h, util7d, utilPeak, reset5h, reset7d, invalid, exhausted, transient, error } = r;
-  return { at: new Date(at).toISOString(), quotaStatus, httpStatus, util5h, util7d, utilPeak, reset5h, reset7d, invalid, exhausted, transient, error };
+  return { at: new Date(at).toISOString(), quotaStatus, httpStatus, util5h, util7d, utilPeak, reset5h, reset7d, invalid, exhausted, transient, error, windows: r.windows, load: transient ? null : load(r) };
 }
 
 function writeStatus(active, slots, state, nextMs) {
@@ -126,7 +129,8 @@ function writeStatus(active, slots, state, nextMs) {
     updatedAt: new Date().toISOString(),
     state,
     active,
-    threshold: THRESHOLD,
+    threshold: THRESHOLD_5H,
+    weeklyThreshold: THRESHOLD_WEEKLY,
     nextProbeAt: new Date(Date.now() + nextMs).toISOString(),
     slots: slots.map((s) => ({
       num: s.num, email: s.email, reading: describe(readings.get(s.num)), detail: readingDetail(readings.get(s.num)),
@@ -151,11 +155,11 @@ function acquireSingleInstance() {
 
 async function main() {
   if (process.argv.includes('--quota')) {
-    return require('./quota-report').quotaReport({ fresh: process.argv.includes('--fresh'), statusFile: STATUS_FILE, threshold: THRESHOLD });
+    return require('./quota-report').quotaReport({ fresh: process.argv.includes('--fresh'), statusFile: STATUS_FILE });
   }
   if (process.argv.includes('--once')) return tick();
   if (!acquireSingleInstance()) return;
-  log(`watcher started (cadence ${SLOW_MS / 1000}/${MID_MS / 1000}/${FAST_MS / 1000}s, threshold ${THRESHOLD * 100}%)`);
+  log(`watcher started (cadence ${SLOW_MS / 1000}/${MID_MS / 1000}/${FAST_MS / 1000}s, lines 5h ${THRESHOLD_5H * 100}% / weekly ${THRESHOLD_WEEKLY * 100}%)`);
   for (;;) {
     const delay = await tick().catch((e) => { log(`tick error: ${e.message}`); return ERROR_MS; });
     await new Promise((r) => setTimeout(r, delay));

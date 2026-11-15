@@ -4,6 +4,7 @@
 const fs = require('fs');
 const { probeToken } = require('./setup-token-quota-probe');
 const { listSetupTokenSlots } = require('./cswap-account-store');
+const { THRESHOLD_5H, THRESHOLD_WEEKLY, isSpent, overLabel } = require('./quota-policy');
 
 const pct = (v) => (v == null ? '-' : `${Math.round(v * 100)}%`);
 
@@ -16,19 +17,21 @@ function duration(ms) {
 
 const resetIn = (epochS) => (epochS ? `in ${duration(epochS * 1000 - Date.now())}` : '-');
 
-function statusLabel(d, threshold) {
+function statusLabel(d) {
   if (!d) return 'unprobed';
   if (d.transient) return 'probe error';
   if (d.invalid) return 'INVALID';
   if (d.exhausted) return 'EXHAUSTED';
-  if (d.utilPeak != null && d.utilPeak >= threshold) return `OVER ${Math.round(threshold * 100)}%`;
+  if (isSpent(d)) return overLabel(d);
   return d.quotaStatus || String(d.httpStatus ?? '-');
 }
 
-function printTable(active, rows, threshold) {
+const linesNote = () => `switch lines 5h ${Math.round(THRESHOLD_5H * 100)}% / weekly ${Math.round(THRESHOLD_WEEKLY * 100)}%`;
+
+function printTable(active, rows) {
   const header = ['SLOT', '', 'STATUS', '5H', 'RESETS', '7D', 'RESETS', 'AS OF'];
   const lines = rows.map(({ num, d }) => [
-    String(num), num === active ? '*' : '', statusLabel(d, threshold),
+    String(num), num === active ? '*' : '', statusLabel(d),
     pct(d?.util5h), resetIn(d?.reset5h), pct(d?.util7d), resetIn(d?.reset7d),
     d?.at ? `${duration(Date.now() - Date.parse(d.at))} ago` : '-',
   ]);
@@ -36,7 +39,7 @@ function printTable(active, rows, threshold) {
   for (const l of [header, ...lines]) console.log(l.map((c, i) => c.padEnd(widths[i])).join('  ').trimEnd());
 }
 
-async function quotaReport({ fresh, statusFile, threshold }) {
+async function quotaReport({ fresh, statusFile }) {
   if (fresh) {
     const { active, slots } = listSetupTokenSlots();
     if (!slots.length) return console.log('No setup-token slots (cswap add-token ...)');
@@ -50,8 +53,8 @@ async function quotaReport({ fresh, statusFile, threshold }) {
       }
       rows.push({ num: s.num, d });
     }
-    console.log(`Fresh probe of ${rows.length} slot(s) · switch threshold ${Math.round(threshold * 100)}% · * = active`);
-    return printTable(active, rows, threshold);
+    console.log(`Fresh probe of ${rows.length} slot(s) · ${linesNote()} · * = active`);
+    return printTable(active, rows);
   }
 
   let status;
@@ -61,8 +64,8 @@ async function quotaReport({ fresh, statusFile, threshold }) {
     return console.log('No status.json yet: is the watcher running? Use --quota --fresh to probe now.');
   }
   const next = status.nextProbeAt ? `next probe in ${duration(Date.parse(status.nextProbeAt) - Date.now())}` : '';
-  console.log(`Watcher: ${status.state} · ${next} · switch threshold ${Math.round(status.threshold * 100)}% · * = active`);
-  printTable(status.active, status.slots.map((s) => ({ num: s.num, d: s.detail })), status.threshold);
+  console.log(`Watcher: ${status.state} · ${next} · ${linesNote()} · * = active`);
+  printTable(status.active, status.slots.map((s) => ({ num: s.num, d: s.detail })));
   if (status.slots.some((s) => !s.detail || s.num !== status.active)) {
     console.log('Idle slots are only probed right before a switch; use --quota --fresh for current numbers.');
   }

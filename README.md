@@ -89,27 +89,31 @@ powershell -ExecutionPolicy ByPass -File deploy\install-windows-task.ps1
 
 - **What gets probed.** Only the active token is probed on a schedule. Each probe is one tiny Haiku turn, about
   $0.0007. Idle tokens are probed only right before a switch.
+- **Separate switch lines per window.** The 5-hour window switches at **90%**; the weekly windows (7d and
+  per-model weekly) at **98%**. The last 10% of a week's budget is far more work than the last 10% of a 5-hour
+  window, so a slot at `5h 0% / 7d 90%` is still a good target. Each window is judged against its own line, and
+  *load* is the binding window's utilization divided by its line (1.0 = at the line).
 - **Adaptive cadence** (±10% jitter so probes don't land on a fixed grid):
 
   | Situation | Next probe in |
   |---|---|
-  | Peak utilization < 70% | 15 min |
-  | 70–85% | 5 min |
-  | ≥ 85%, or up ≥ 5 points since the last probe | 2 min |
+  | Load < 78% (5h < ~70%) | 15 min |
+  | Load 78–94% | 5 min |
+  | Load ≥ 94% (5h ≥ ~85%), or up ≥ 5 points since the last probe | 2 min |
   | Probe error | 5 min |
-  | All tokens spent | 10 min |
+  | Blocked while the active token still serves | 2 min |
+  | Every token dead (rejected/invalid) | 10 min |
 
-- **When it switches:** peak utilization ≥ 90% across all windows (5h, 7d, per-model), status `rejected`/429,
-  or an invalid token (401/403).
-- **Which token it picks:** the healthy token with the lowest utilization. There is a 2-minute cooldown between
-  threshold-based switches.
+- **When it switches:** any window reaches its line, status `rejected`/429, or an invalid token (401/403).
+- **Which token it picks:** the token with the lowest load that is under all its lines. There is a 2-minute
+  cooldown between threshold-based switches.
 - **When every other token is also over the threshold:**
   - While the active token still serves, the watcher stays on it and `status.json` shows `blocked`. Moving
     between near-full tokens would only burn probes.
   - Once the active token stops serving (`rejected`/429, or invalid), it escapes to the slot with the most room
     left that still answers, even if that slot is over the threshold (state `escaped: all tokens over threshold`).
-  - While blocked, every slot is re-checked about every 10 minutes, and the watcher switches as soon as one drops
-    back under the threshold after its window resets.
+  - While blocked and the active token still serves, it is re-checked every 2 minutes (it is close to dying), and
+    every slot is re-checked each time. The watcher switches as soon as one drops back under its lines after a reset.
 - **Manual switches are respected.** Each tick reads the active slot from cswap, so `cswap switch` by hand is fine.
 - **Limitation:** a token can still hit a 429 between two probes. That one agent turn fails; the next probe
   switches, and you re-send the prompt. Paseo marks such a turn as `completed`, not `error`.
@@ -136,7 +140,8 @@ before relying on it.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AUTOSWAP_THRESHOLD` | `0.9` | Switch when peak utilization reaches this |
+| `AUTOSWAP_THRESHOLD` | `0.9` | Switch line for the 5-hour window |
+| `AUTOSWAP_WEEKLY_THRESHOLD` | `0.98` | Switch line for the weekly windows (7d and per-model) |
 | `AUTOSWAP_SLOW_S` / `_MID_S` / `_FAST_S` | `900` / `300` / `120` | Cadence tiers |
 | `AUTOSWAP_COOLDOWN_S` | `120` | Minimum gap between threshold-based switches |
 | `AUTOSWAP_PROBE_MODEL` | `haiku` | Model used for the probe turn |
@@ -154,10 +159,10 @@ node token-autoswap-watcher.js --quota --fresh  # probe every slot now (~$0.0007
 ```
 
 ```
-Fresh probe of 2 slot(s) · switch threshold 90% · * = active
-SLOT     STATUS    5H   RESETS     7D   RESETS      AS OF
-2     *  allowed   16%  in 4h 42m  2%   in 12h 32m  0m ago
-3        OVER 90%  29%  in 42m     90%  in 1d 9h    0m ago
+Fresh probe of 2 slot(s) · switch lines 5h 90% / weekly 98% · * = active
+SLOT     STATUS        5H   RESETS     7D   RESETS      AS OF
+2     *  OVER 5h 90%   91%  in 1h 12m  12%  in 9h 2m    0m ago
+3        allowed       0%   in 4h 38m  90%  in 1d 6h    0m ago
 ```
 
 Without `--fresh`, idle slots only have the reading from the last switch (or `unprobed` after a restart).
@@ -177,6 +182,7 @@ on, and that probe would run alongside this watcher's.
 |---|---|
 | `token-autoswap-watcher.js` | Main loop: probe, decide, switch, adaptive cadence |
 | `setup-token-quota-probe.js` | Runs `claude -p` and parses `rate_limit_event` |
+| `quota-policy.js` | Per-window switch lines, load, "spent" test (shared by the watcher and `--quota`) |
 | `quota-report.js` | `--quota` table (from `status.json`, or `--fresh` probes of every slot) |
 | `cswap-account-store.js` | Reads cswap's roster and stored tokens; switches via the `cswap` CLI |
 | `deploy/` | Installers: systemd (Linux), launchd (macOS), Scheduled Task (Windows) |
