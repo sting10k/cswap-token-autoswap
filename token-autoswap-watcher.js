@@ -6,7 +6,8 @@
 const fs = require('fs');
 const path = require('path');
 const { probeToken } = require('./setup-token-quota-probe');
-const { listSetupTokenSlots, switchTo } = require('./cswap-account-store');
+const { listSetupTokenSlots, switchTo, ROSTER_FILE } = require('./cswap-account-store');
+const { waitForRosterChangeOrTimeout } = require('./roster-change-wait');
 const { THRESHOLD_5H, THRESHOLD_WEEKLY, load, isSpent, binding, shortName } = require('./quota-policy');
 
 // Adaptive cadence (mirrors claude-swap's poll_policy, but sparser since each probe is a real
@@ -16,7 +17,8 @@ const { THRESHOLD_5H, THRESHOLD_WEEKLY, load, isSpent, binding, shortName } = re
 const SLOW_MS = Number(process.env.AUTOSWAP_SLOW_S || 900) * 1000; // load < MID_AT
 const MID_MS = Number(process.env.AUTOSWAP_MID_S || 300) * 1000; // MID_AT <= load < FAST_AT
 const FAST_MS = Number(process.env.AUTOSWAP_FAST_S || 120) * 1000; // load >= FAST_AT, rising fast, or blocked
-const BLOCKED_MS = 600 * 1000; // every token dead: wait for a reset
+const BLOCKED_MS = 600 * 1000; // every token dead: wait for a reset (or sooner, see untilSoonestReset)
+const MIN_TICK_GAP_MS = 30 * 1000; // roster-change wakeups never probe more often than this
 const ERROR_MS = 300 * 1000; // probe failed (network, CLI): retry sooner than SLOW
 const MID_AT = 0.78; // ~70% of a 90% line
 const FAST_AT = 0.94; // ~85% of a 90% line
@@ -104,9 +106,22 @@ async function tick() {
     const escape = probed.filter(({ r }) => !r.transient && !r.exhausted && !r.invalid).sort(byRoom)[0];
     if (escape) return switchAndReport(active, currentReading, escape, slots, 'escaped: all tokens over threshold');
   }
-  // Blocked but the active token still serves: it is close to dying, so check again soon to escape quickly
-  const blockedMs = current && !hardFail ? FAST_MS : BLOCKED_MS;
+  // Blocked but the active token still serves: it is close to dying, so check again soon to escape quickly.
+  // Every token dead: wake right after the soonest window resets (at most BLOCKED_MS).
+  const blockedMs = current && !hardFail ? FAST_MS : Math.min(BLOCKED_MS, untilSoonestReset(slots));
   return writeStatus(active, slots, current ? 'blocked: all tokens spent' : 'blocked: no healthy token to move onto', blockedMs);
+}
+
+// ms until the soonest known window reset across all slots, plus a small margin; BLOCKED_MS if unknown
+function untilSoonestReset(slots) {
+  let soonest = Infinity;
+  for (const s of slots) {
+    const r = readings.get(s.num);
+    if (!r || r.transient) continue;
+    const resets = [r.reset5h, r.reset7d, ...Object.values(r.windows || {}).map((w) => w?.resetsAt)];
+    for (const t of resets) if (t && t * 1000 > Date.now()) soonest = Math.min(soonest, t * 1000);
+  }
+  return Number.isFinite(soonest) ? Math.max(MIN_TICK_GAP_MS, soonest - Date.now() + 30 * 1000) : BLOCKED_MS;
 }
 
 async function switchAndReport(active, currentReading, target, slots, state) {
@@ -161,10 +176,18 @@ async function main() {
   if (!acquireSingleInstance()) return;
   log(`watcher started (cadence ${SLOW_MS / 1000}/${MID_MS / 1000}/${FAST_MS / 1000}s, lines 5h ${THRESHOLD_5H * 100}% / weekly ${THRESHOLD_WEEKLY * 100}%)`);
   for (;;) {
+    const tickedAt = Date.now();
     const delay = await tick().catch((e) => { log(`tick error: ${e.message}`); return ERROR_MS; });
-    await new Promise((r) => setTimeout(r, delay));
+    // Wake early when cswap's roster changes (token added/removed, manual switch), but never tick more
+    // often than MIN_TICK_GAP_MS even if something keeps rewriting the file
+    const woke = await waitForRosterChangeOrTimeout(ROSTER_FILE, delay);
+    if (woke === 'roster-changed') {
+      log('cswap roster changed (slot added/removed or manual switch): re-checking now');
+      const gap = MIN_TICK_GAP_MS - (Date.now() - tickedAt);
+      if (gap > 0) await new Promise((r) => setTimeout(r, gap));
+    }
   }
 }
 
-module.exports = { cadenceFor, tick };
+module.exports = { cadenceFor, tick, untilSoonestReset };
 if (require.main === module) main();

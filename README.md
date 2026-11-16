@@ -102,7 +102,8 @@ powershell -ExecutionPolicy ByPass -File deploy\install-windows-task.ps1
   | Load ≥ 94% (5h ≥ ~85%), or up ≥ 5 points since the last probe | 2 min |
   | Probe error | 5 min |
   | Blocked while the active token still serves | 2 min |
-  | Every token dead (rejected/invalid) | 10 min |
+  | Every token dead (rejected/invalid) | right after the soonest window reset, at most 10 min |
+  | cswap roster changed (`add-token`, `remove`, manual `switch`) | within ~5 s (at least 30 s after the previous check) |
 
 - **When it switches:** any window reaches its line, status `rejected`/429, or an invalid token (401/403).
 - **Which token it picks:** the token with the lowest load that is under all its lines. There is a 2-minute
@@ -114,6 +115,9 @@ powershell -ExecutionPolicy ByPass -File deploy\install-windows-task.ps1
     left that still answers, even if that slot is over the threshold (state `escaped: all tokens over threshold`).
   - While blocked and the active token still serves, it is re-checked every 2 minutes (it is close to dying), and
     every slot is re-checked each time. The watcher switches as soon as one drops back under its lines after a reset.
+- **New tokens are picked up right away.** The watcher polls the mtime of cswap's `sequence.json` every 5 s (no API
+  call). Adding or removing a slot, or switching by hand, triggers a check within seconds, so a token added while
+  every other one is dead is switched to immediately instead of at the next scheduled probe.
 - **Manual switches are respected.** Each tick reads the active slot from cswap, so `cswap switch` by hand is fine.
 - **Limitation:** a token can still hit a 429 between two probes. That one agent turn fails; the next probe
   switches, and you re-send the prompt. Paseo marks such a turn as `completed`, not `error`.
@@ -182,6 +186,7 @@ on, and that probe would run alongside this watcher's.
 |---|---|
 | `token-autoswap-watcher.js` | Main loop: probe, decide, switch, adaptive cadence |
 | `setup-token-quota-probe.js` | Runs `claude -p` and parses `rate_limit_event` |
+| `roster-change-wait.js` | Sleep that ends early when cswap's `sequence.json` changes |
 | `quota-policy.js` | Per-window switch lines, load, "spent" test (shared by the watcher and `--quota`) |
 | `quota-report.js` | `--quota` table (from `status.json`, or `--fresh` probes of every slot) |
 | `cswap-account-store.js` | Reads cswap's roster and stored tokens; switches via the `cswap` CLI |

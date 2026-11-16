@@ -15,10 +15,11 @@ function defaultBackupDir() {
 }
 
 const BACKUP_DIR = process.env.CSWAP_BACKUP_DIR || defaultBackupDir();
+const ROSTER_FILE = path.join(BACKUP_DIR, 'sequence.json');
 const CSWAP_BIN = process.env.CSWAP_BIN || 'cswap';
 
 function readRoster() {
-  const seq = JSON.parse(fs.readFileSync(path.join(BACKUP_DIR, 'sequence.json'), 'utf8'));
+  const seq = JSON.parse(fs.readFileSync(ROSTER_FILE, 'utf8'));
   return { active: seq.activeAccountNumber, order: seq.sequence || [], accounts: seq.accounts || {} };
 }
 
@@ -72,4 +73,4 @@ function switchTo(num) {
   });
 }
 
-module.exports = { listSetupTokenSlots, switchTo, BACKUP_DIR };
+module.exports = { listSetupTokenSlots, switchTo, BACKUP_DIR, ROSTER_FILE };
